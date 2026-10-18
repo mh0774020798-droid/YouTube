@@ -73,6 +73,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           python -m pip install --disable-pip-version-check -r requirements.txt
+          # yt-dlp recommends nightly when stable breaks after YouTube changes.
+          python -m pip install --disable-pip-version-check --upgrade --pre "yt-dlp[default]"
+          python -m yt_dlp --version
       - name: Download requested media
         env:
           YT_COOKIE_PRIVATE_KEY: ${{ secrets.YT_COOKIE_PRIVATE_KEY }}
