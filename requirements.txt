@@ -1,0 +1,3 @@
+# The workflow installs the current yt-dlp release, including its bundled EJS support.
+yt-dlp[default]
+cryptography>=44
