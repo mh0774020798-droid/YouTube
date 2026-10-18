@@ -14,6 +14,47 @@ import sys
 import tempfile
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
+WORKER_VERSION = "1.1.2"
+
+
+def safe_diagnostic(message, secrets=()):
+    """Keep the useful error while removing cookies, keys and signed URLs."""
+    text = str(message)
+    for secret in sorted({str(s) for s in secrets if s}, key=len, reverse=True):
+        text = text.replace(secret, "[secret removed]")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+                  "[private key removed]", text, flags=re.DOTALL)
+    text = re.sub(r"(?im)^\s*(?:#HttpOnly_)?[^\s]+\t(?:TRUE|FALSE)\t[^\r\n]*",
+                  "[cookie row removed]", text)
+    text = re.sub(r"(?im)\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:[^\r\n]*",
+                  "[sensitive header removed]", text)
+    text = re.sub(r"\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+", "[token removed]", text)
+    text = re.sub(r"(?i)https?://[^\s<>\"']+", "[URL removed]", text)
+    text = re.sub(r"(?i)\b(?:access[_-]?token|api[_-]?key|client[_-]?secret|password|signature|sig)"
+                  r"\s*[=:]\s*[^\s,;]+", "[credential removed]", text)
+    return " ".join(text.split())[:1000]
+
+
+def failure_hint(message):
+    """A suggestion follows the reported error; it is not a guessed diagnosis."""
+    lower = message.lower()
+    if any(s in lower for s in ("sign in", "login required", "cookies are no longer valid", "confirm you're not a bot")):
+        return "YouTube requested authentication. If you have access to this video, try fresh encrypted YouTube cookies. A runner IP block can still prevent access."
+    if "requested format is not available" in lower or "no video formats" in lower:
+        return "Try a different quality or output format. The requested video format was unavailable."
+    if "429" in lower or "too many requests" in lower:
+        return "YouTube is limiting requests. Wait before starting another download."
+    if "403" in lower or "forbidden" in lower:
+        return "YouTube refused access from this runner. Retrying or adding cookies does not guarantee access."
+    if "private video" in lower or "video unavailable" in lower or "not available in your country" in lower:
+        return "Check that the video is available and that your account is allowed to view it."
+    if "ffmpeg" in lower and any(s in lower for s in ("not found", "not installed", "not available")):
+        return "Check that the workflow installed FFmpeg successfully."
+    if "certificate_verify_failed" in lower or "certificate verify failed" in lower:
+        return "The runner could not verify the server certificate. Check its network and trusted certificates."
+    return "Use the error details above to check the video, output settings or runner access."
+
 
 def boolean(value):
     return value is True or str(value).lower() == "true"
@@ -127,7 +168,7 @@ def download_options(cfg, output, cookiefile=None):
             "writethumbnail": cfg["thumbnail"], "writeinfojson": cfg["metadata"], "clean_infojson": True,
             "writesubtitles": cfg["subtitles"], "writeautomaticsub": cfg["subtitles"],
             "subtitleslangs": ["he", "en"], "subtitlesformat": "vtt/best",
-            "postprocessors": postprocessors, "quiet": True, "no_warnings": True,
+            "postprocessors": postprocessors, "quiet": True, "no_warnings": False,
             "socket_timeout": 30, "retries": 3, "fragment_retries": 3,
             "concurrent_fragment_downloads": 3, "js_runtimes": {"node": {}},
             "max_filesize": 2 * 1024**3, "skip_unavailable_fragments": False,
@@ -140,41 +181,57 @@ def download_options(cfg, output, cookiefile=None):
 
 
 class SafeLogger:
-    def __init__(self):
+    def __init__(self, secrets=()):
         self.errors = []
+        self.warnings = []
+        self.secrets = secrets
     def debug(self, message):
         pass
     def warning(self, message):
-        pass
+        self._remember(self.warnings, message, 10)
     def error(self, message):
-        # Do not echo upstream URLs, credentials, headers or cookie contents.
-        self.errors.append("An item could not be downloaded. The source may be unavailable or require updated cookies.")
+        self._remember(self.errors, message, 30)
+    def _remember(self, target, message, limit):
+        value = safe_diagnostic(message, self.secrets)
+        if value and value not in target and len(target) < limit:
+            target.append(value)
 
 
 def perform(inputs, output, downloader=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    report = {"status": "failed", "downloaded_files": [], "errors": []}
+    report = {"status": "failed", "downloaded_files": [], "errors": [],
+              "worker_version": WORKER_VERSION, "stage": "validate"}
     cookie_path = None
+    logger = None
+    secrets = [str(inputs.get("encrypted_cookies", "")), os.environ.get("YT_COOKIE_PRIVATE_KEY", "")]
+    print("YouTube Proxy worker " + WORKER_VERSION, flush=True)
     try:
         cfg = validate(inputs)
         report.update({key: value for key, value in cfg.items()})
         encrypted = str(inputs.get("encrypted_cookies", ""))
         if encrypted:
+            report["stage"] = "decrypt_cookies"
             text = decrypt_cookies(encrypted, os.environ.get("YT_COOKIE_PRIVATE_KEY", ""), cfg["job_id"])
+            secrets.extend(line.split("\t")[6] for line in text.splitlines()
+                           if not line.startswith("#") and len(line.split("\t")) == 7)
+            secrets.extend(line.removeprefix("#HttpOnly_").split("\t")[6] for line in text.splitlines()
+                           if line.startswith("#HttpOnly_") and len(line.split("\t")) == 7)
             temp = tempfile.NamedTemporaryFile(prefix="yt-cookies-", suffix=".txt", delete=False,
                 dir=os.environ.get("RUNNER_TEMP") or None)
             cookie_path = Path(temp.name)
+            secrets.append(str(cookie_path))
             try:
                 os.chmod(cookie_path, 0o600)
                 temp.write(text.encode("utf-8"))
             finally:
                 temp.close()
             text = ""
+        report["stage"] = "initialize_downloader"
         if downloader is None:
             from yt_dlp import YoutubeDL
             downloader = YoutubeDL
-        logger = SafeLogger()
+        logger = SafeLogger(secrets)
         opts = download_options(cfg, output, cookie_path)
         opts["logger"] = logger
         completed = set()
@@ -186,7 +243,9 @@ def perform(inputs, output, downloader=None):
                 print(f"Finished media stream {len(completed)}", flush=True)
         opts["progress_hooks"] = [progress]
         with downloader(opts) as ydl:
+            report["stage"] = "download"
             result = ydl.download([cfg["url"]])
+        report["stage"] = "check_output"
         media_files = [p for p in (output / "media").rglob("*") if p.is_file()]
         report["downloaded_files"] = [{"path": str(p.relative_to(output)), "bytes": p.stat().st_size} for p in media_files]
         playable = [p for p in media_files if p.suffix.lower() in {".mp4", ".webm", ".mp3", ".m4a", ".mkv"}]
@@ -195,16 +254,18 @@ def perform(inputs, output, downloader=None):
             raise RuntimeError("No playable files were downloaded. YouTube may require fresh cookies or may block the runner.")
         report["status"] = "success" if result == 0 and not logger.errors else "partial"
         report["media_count"] = len(playable)
+        report["stage"] = "completed"
         return 0 if report["status"] == "success" else 1
-    except (ValueError, RuntimeError) as exc:
-        report["errors"].append(str(exc)[:800])
-        return 1
-    except Exception:
-        report["errors"].append("The media service returned an error. Check the URL, output settings and YouTube access from the runner.")
+    except Exception as exc:
+        report["exception_type"] = type(exc).__name__
+        report["errors"].append(safe_diagnostic(exc, secrets) or "The download failed without further error details.")
         return 1
     finally:
         if cookie_path:
             cookie_path.unlink(missing_ok=True)
+        reported = (logger.errors if logger else []) + report["errors"]
+        report["errors"] = list(dict.fromkeys(reported))[:30]
+        report["warnings"] = logger.warnings if logger else []
         # Preserve an accurate inventory even when a later item or conversion fails.
         if not report["downloaded_files"]:
             files = [p for p in (output / "media").rglob("*") if p.is_file()]
@@ -213,16 +274,30 @@ def perform(inputs, output, downloader=None):
             report["media_count"] = count
             if count and report["status"] == "failed":
                 report["status"] = "partial"
+        if report["errors"]:
+            report["next_step"] = failure_hint(" ".join(report["errors"]))
+            print("YouTube Proxy error details at stage: " + report["stage"], flush=True)
+            if report.get("exception_type"):
+                print("Exception: " + report["exception_type"], flush=True)
+            for message in report["errors"][:5]:
+                print("YouTube Proxy error: " + message, flush=True)
+            print("Next step: " + report["next_step"], flush=True)
+        for message in report["warnings"][:3]:
+            print("YouTube Proxy warning: " + message, flush=True)
         (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         (output / "READ-ME.txt").write_text(
             "YouTube Proxy result\n\nMedia files are in media/.\n"
             "report.json lists files, sizes and any errors.\n"
-            "An empty media folder usually means YouTube blocked this runner or required fresh cookies.\n"
+            "If no media was downloaded, read the error details in report.json or the workflow log.\n"
             "No cookie file or private key is included in this artifact.\n", encoding="utf-8")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as f:
                 f.write(f"## YouTube Proxy\nStatus: {report['status']}\n\nMedia files: {report.get('media_count', 0)}\n")
+                if report["errors"]:
+                    # A code block keeps upstream text from creating links or markup.
+                    details = "\n".join(report["errors"][:5]).replace("`", "'")
+                    f.write("\nError details:\n\n```text\n" + details + "\n```\n")
 
 
 def main():
