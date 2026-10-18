@@ -14,7 +14,7 @@ import sys
 import tempfile
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
-WORKER_VERSION = "1.1.2"
+WORKER_VERSION = "1.2.0"
 
 
 def safe_diagnostic(message, secrets=()):
@@ -90,7 +90,7 @@ def validate(inputs):
         or re.fullmatch(r"/@[\w.-]+(/(videos|shorts|streams))?/?", path, re.UNICODE)
     ):
         raise ValueError("URL must point to a video, playlist or channel")
-    fmt = inputs.get("format", "mp4")
+    fmt = inputs.get("format", "mp3")
     quality = str(inputs.get("quality", "720"))
     mode = inputs.get("mode", "single")
     count = int(inputs.get("max_items", "20"))
@@ -197,13 +197,40 @@ class SafeLogger:
             target.append(value)
 
 
+def publish_media(output, cfg):
+    """Publish complete files in the requested format and explicitly selected extras."""
+    delivery = output / 'delivery'
+    delivery.mkdir(parents=True, exist_ok=True)
+    files = []
+    for source in sorted((output / 'media').rglob('*')):
+        if not source.is_file() or source.is_symlink() or source.stat().st_size == 0:
+            continue
+        suffix = source.suffix.lower()
+        selected = suffix == '.' + cfg['format']
+        selected |= cfg['subtitles'] and suffix in {'.srt', '.vtt', '.ass'}
+        selected |= cfg['thumbnail'] and suffix in {'.jpg', '.jpeg', '.png', '.webp'}
+        selected |= cfg['metadata'] and source.name.endswith('.info.json')
+        if not selected:
+            continue
+        target = delivery / source.relative_to(output / 'media')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+        files.append(target)
+    return files
+
+
 def perform(inputs, output, downloader=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     report = {"status": "failed", "downloaded_files": [], "errors": [],
-              "worker_version": WORKER_VERSION, "stage": "validate"}
+              "worker_version": WORKER_VERSION, "stage": "validate",
+              "cookie_supplied": bool(str(inputs.get('encrypted_cookies', '')).strip()), "media_only_delivery": True}
     cookie_path = None
     logger = None
+    cfg = None
     secrets = [str(inputs.get("encrypted_cookies", "")), os.environ.get("YT_COOKIE_PRIVATE_KEY", "")]
     print("YouTube Proxy worker " + WORKER_VERSION, flush=True)
     try:
@@ -248,10 +275,10 @@ def perform(inputs, output, downloader=None):
         report["stage"] = "check_output"
         media_files = [p for p in (output / "media").rglob("*") if p.is_file()]
         report["downloaded_files"] = [{"path": str(p.relative_to(output)), "bytes": p.stat().st_size} for p in media_files]
-        playable = [p for p in media_files if p.suffix.lower() in {".mp4", ".webm", ".mp3", ".m4a", ".mkv"}]
+        playable = [p for p in media_files if p.suffix.lower() == '.' + cfg['format'] and p.stat().st_size > 0]
         report["errors"] = logger.errors[:30]
         if not playable:
-            raise RuntimeError("No playable files were downloaded. YouTube may require fresh cookies or may block the runner.")
+            raise RuntimeError("No playable files were downloaded in the requested format. Read the upstream error or conversion warning.")
         report["status"] = "success" if result == 0 and not logger.errors else "partial"
         report["media_count"] = len(playable)
         report["stage"] = "completed"
@@ -270,12 +297,16 @@ def perform(inputs, output, downloader=None):
         if not report["downloaded_files"]:
             files = [p for p in (output / "media").rglob("*") if p.is_file()]
             report["downloaded_files"] = [{"path": str(p.relative_to(output)), "bytes": p.stat().st_size} for p in files]
-            count = sum(p.suffix.lower() in {".mp4", ".webm", ".mp3", ".m4a", ".mkv"} for p in files)
+            count = sum(p.suffix.lower() == '.' + cfg['format'] and p.stat().st_size > 0 for p in files) if cfg else 0
             report["media_count"] = count
             if count and report["status"] == "failed":
                 report["status"] = "partial"
         if report["errors"]:
-            report["next_step"] = failure_hint(" ".join(report["errors"]))
+            combined = " ".join(report["errors"])
+            report['error_code'] = 'auth_required' if re.search(r'sign in|login required|cookies are no longer valid', combined, re.I) else 'download_failed'
+            report["next_step"] = failure_hint(combined)
+            if report['error_code'] == 'auth_required' and not report['cookie_supplied']:
+                report['next_step'] = 'No YouTube cookies were sent with this request. Select your cookies file in the userscript and start a new request. ' + report['next_step']
             print("YouTube Proxy error details at stage: " + report["stage"], flush=True)
             if report.get("exception_type"):
                 print("Exception: " + report["exception_type"], flush=True)
@@ -284,6 +315,8 @@ def perform(inputs, output, downloader=None):
             print("Next step: " + report["next_step"], flush=True)
         for message in report["warnings"][:3]:
             print("YouTube Proxy warning: " + message, flush=True)
+        delivery = publish_media(output, cfg) if cfg else []
+        report['delivered_files'] = [{'path': str(p.relative_to(output / 'delivery')), 'bytes': p.stat().st_size} for p in delivery]
         (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         (output / "READ-ME.txt").write_text(
             "YouTube Proxy result\n\nMedia files are in media/.\n"
