@@ -19,7 +19,7 @@ on:
         options: [single, collection]
       format:
         description: Output format
-        default: mp4
+        default: mp3
         type: choice
         options: [mp4, webm, mp3, m4a]
       quality:
@@ -80,13 +80,22 @@ jobs:
         env:
           YT_COOKIE_PRIVATE_KEY: ${{ secrets.YT_COOKIE_PRIVATE_KEY }}
         run: python scripts/download.py --event "$GITHUB_EVENT_PATH" --output output
-      - name: Upload media and result report
+      - name: Upload selected media only
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: youtube-${{ inputs.job_id }}
-          path: output/
+          path: output/delivery/
           if-no-files-found: warn
           retention-days: 1
           compression-level: 0
           include-hidden-files: false
+      - name: Keep failure report for troubleshooting
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: youtube-report-${{ inputs.job_id }}
+          path: output/report.json
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0
