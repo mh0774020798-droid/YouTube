@@ -1,0 +1,89 @@
+name: YouTube Proxy download
+run-name: youtube-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Unique extension job ID
+        required: true
+        type: string
+      url:
+        description: YouTube video, playlist or channel HTTPS URL
+        required: true
+        type: string
+      mode:
+        description: Download scope
+        default: single
+        type: choice
+        options: [single, collection]
+      format:
+        description: Output format
+        default: mp4
+        type: choice
+        options: [mp4, webm, mp3, m4a]
+      quality:
+        description: Maximum video height or best
+        default: '720'
+        type: string
+      max_items:
+        description: Collection limit, 0 for no item limit
+        default: '20'
+        type: string
+      subtitles:
+        description: Include available Hebrew and English subtitles
+        default: false
+        type: boolean
+      thumbnail:
+        description: Include thumbnails
+        default: false
+        type: boolean
+      metadata:
+        description: Include video metadata JSON
+        default: false
+        type: boolean
+      encrypted_cookies:
+        description: Optional RSA-OAEP and AES-GCM encrypted YouTube cookies
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install media tools on the runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Download requested media
+        env:
+          YT_COOKIE_PRIVATE_KEY: ${{ secrets.YT_COOKIE_PRIVATE_KEY }}
+        run: python scripts/download.py --event "$GITHUB_EVENT_PATH" --output output
+      - name: Upload media and result report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: youtube-${{ inputs.job_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0
+          include-hidden-files: false
