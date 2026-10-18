@@ -1,0 +1,50 @@
+name: YouTube Proxy search
+run-name: youtube-search-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Unique search job ID
+        required: true
+        type: string
+      query:
+        description: Search words, 2 to 160 characters
+        required: true
+        type: string
+      limit:
+        description: Maximum results, 1 to 20
+        default: '10'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-search-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install search tool
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Search YouTube without downloading media
+        run: python scripts/search.py --event "$GITHUB_EVENT_PATH" --output search-output
+      - name: Return search results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: youtube-search-${{ inputs.job_id }}
+          path: search-output/results.json
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1
